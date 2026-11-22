@@ -6,7 +6,7 @@
     <title>Magic Christmas Tree - Hand Interaction</title>
     <style>
         body { 
-            margin: 0; overflow: hidden; background-color: #000; 
+            margin: 0; overflow: hidden; background: radial-gradient(ellipse at center, #132d35, #030c14);
             font-family: 'Helvetica Neue', Arial, sans-serif; 
             display: flex; justify-content: center; align-items: center; 
             height: 100vh; user-select: none;
@@ -54,13 +54,14 @@
         }
 
         .instructions {
+            display: none;
             font-size: 0.85rem; color: #ccc; line-height: 1.8; max-width: 300px;
             background: rgba(10, 10, 10, 0.6); padding: 20px; border-radius: 12px;
             border-left: 2px solid #d4af37; backdrop-filter: blur(8px);
             border-top: 1px solid rgba(255, 255, 255, 0.05);
         }
         .highlight { color: #d4af37; font-weight: 600; padding: 0 4px; }
-        #status-text { margin-bottom: 12px; font-size: 1.1rem; color: #fff; font-weight: 500; display: flex; align-items: center; gap: 8px;}
+        #status-text { display: none; }
         .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #555; display: inline-block;}
 
         /* 按钮 */
@@ -126,10 +127,16 @@
             <h1>Merry Christmas</h1>
             <div id="status-text"><span class="status-dot" id="status-dot"></span><span id="status-msg">初始化引擎...</span></div>
             <div class="instructions">
-                • <span class="highlight">握拳</span> : 聚合圣诞树<br/>
-                • <span class="highlight">张手</span> : 星云散开<br/>
-                • <span class="highlight">挥动</span> : 旋转视图 (仅散开时)<br/>
-                • <span class="highlight">捏合</span> : 抓取照片 (需上传)
+                • <span class="highlight">数字手势 1–9</span> : 显示本页对应照片（保持半秒）<br/>
+                • <span class="highlight">1–4</span> : 从食指依次伸出，5 为五指张开<br/>
+                • <span class="highlight">6</span> : 拇指＋小指；<span class="highlight">7</span> : 拇指＋食指＋中指<br/>
+                • <span class="highlight">8</span> : 拇指＋食指呈 L；<span class="highlight">9</span> : 食指弯钩<br/>
+                • <span class="highlight">5 指张开</span> : 仅散开；6–9 对应第 5–8 张<br/>
+                • <span class="highlight">👍 / 👎</span> : 下一页 / 上一页（保持约 0.7 秒）<br/>
+                • <span class="highlight">握拳</span> : 返回圣诞树<br/>
+                • <span class="highlight">挥动</span> : 散开时旋转视图
+                <div id="photo-page" style="margin-top:12px;color:#ffd700">上传照片后，伸出 数字手势 1–9查看</div>
+                <div id="photo-list" style="font-size:0.75rem;line-height:1.5;color:#ddd"></div>
             </div>
             <button id="upload-btn" onclick="document.getElementById('file-input').click()">上传纪念照片</button>
             <input type="file" id="file-input" multiple accept="image/*">
@@ -155,9 +162,12 @@
             treeHeight: 75,
             maxRadius: 30,
             camDistance: 110,
-            bloomStrength: 0.7,
-            bloomThreshold: 0.35,
-            bloomRadius: 0.6
+            photoScatterRadius: 60,
+            photoSurfaceGap: 4,
+            bloomStrength: 0.22,
+            bloomThreshold: 1.1,
+            bloomRadius: 0.6,
+            gesture: { emaTimeMs: 140, confirmMs: 500, pageMs: 650, maxGapMs: 250 }
         };
 
         const STATE = { TREE: 'tree', SCATTER: 'scatter', ZOOM: 'zoom' };
@@ -170,6 +180,8 @@
         let goldMesh, silverMesh, gemMesh, emeraldMesh, dustSystem;
         let photoMeshes = [];
         let zoomTargetIndex = -1;
+        let photoPage = 0;
+        let lastPalmTime = null;
         
         // --- 逻辑变量 ---
         let logicData = { gold: [], silver: [], gem: [], emerald: [], dust: [], star: null };
@@ -177,12 +189,101 @@
         const _tempVec3 = new THREE.Vector3(); // 复用变量，减少GC
         const _tempEuler = new THREE.Euler();
         let time = 0;
+        let christmasSnow;
+        let lastSnowTime = null;
         
         // --- 交互变量 ---
         let handPos = { x: 0, y: 0 };
         let lastHandPos = { x: 0, y: 0 };
         let isHandPresent = false;
         let rotationVelocity = { x: 0, y: 0 }; // 物理惯性
+
+        // BEGIN NUMBER GESTURES
+        function classifyHand(points) {
+            const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, (a.z || 0) - (b.z || 0));
+            const angle = (a, b, c) => {
+                const u = [a.x-b.x, a.y-b.y, (a.z||0)-(b.z||0)];
+                const v = [c.x-b.x, c.y-b.y, (c.z||0)-(b.z||0)];
+                const length = Math.hypot(...u) * Math.hypot(...v);
+                return length ? Math.acos(Math.max(-1, Math.min(1, u.reduce((sum, x, i) => sum+x*v[i], 0)/length))) * 180 / Math.PI : 0;
+            };
+            const scale = distance(points[0], points[9]);
+            if (scale < 0.025) return null;
+            const fingers = [5, 9, 13, 17].map(base =>
+                angle(points[base], points[base+1], points[base+3]) > 155 &&
+                distance(points[base+3], points[0]) > distance(points[base+1], points[0]) + scale * 0.15);
+            const thumb = angle(points[2], points[3], points[4]) > 150 && distance(points[4], points[5]) > scale * 0.65;
+            const pattern = fingers.map(Number).join('');
+            // 中文数字 7：拇指、食指、中指聚拢；无需另做捏合确认。
+            const gatheredSeven = !fingers[2] && !fingers[3] &&
+                distance(points[4], points[8]) < scale * 0.45 && distance(points[8], points[12]) < scale * 0.45 &&
+                Math.min(distance(points[8], points[0]), distance(points[12], points[0])) >
+                    Math.max(distance(points[16], points[0]), distance(points[20], points[0])) + scale * 0.25;
+            if (gatheredSeven) return '7';
+            if (pattern === '0001' && thumb) return '6';
+            if (pattern === '1000' && thumb) return '8';
+            if (pattern === '1100' && thumb) return '7';
+            // 中文数字 9：仅食指弯成钩，其余手指收起。
+            const indexAngle = angle(points[5], points[6], points[8]);
+            if (!thumb && !fingers[1] && !fingers[2] && !fingers[3] && indexAngle > 55 && indexAngle < 150 &&
+                distance(points[6], points[0]) > distance(points[5], points[0]) + scale * 0.25) return '9';
+            if (pattern === '0000') {
+                if (!thumb) return 'fist';
+                const dy = points[4].y - points[2].y;
+                const dx = points[4].x - points[2].x;
+                if (Math.abs(dy) > scale * 0.45 && Math.abs(dy) > Math.abs(dx)) return dy < 0 ? 'next' : 'previous';
+                return null;
+            }
+            if (pattern === '1000' && !thumb) return '1';
+            if (pattern === '1100' && !thumb) return '2';
+            if (pattern === '1110' && !thumb) return '3';
+            if (pattern === '1111') return thumb ? '5' : '4';
+            return null;
+        }
+
+        class NumberGestureGate {
+            constructor(config) { this.config = config; this.lastAction = null; this.reset(); }
+            reset() { this.pending = null; this.since = null; this.lastTime = null; this.releaseSince = null; }
+            update(key, now) {
+                if (this.lastTime !== null && now - this.lastTime > this.config.maxGapMs) this.reset();
+                this.lastTime = now;
+                if (!key) {
+                    this.pending = null; this.since = null;
+                    if (this.releaseSince === null) this.releaseSince = now;
+                    if (now - this.releaseSince >= 250) this.lastAction = null;
+                    return null;
+                }
+                this.releaseSince = null;
+                if (key !== this.pending) { this.pending = key; this.since = now; return null; }
+                const duration = key === 'next' || key === 'previous' ? this.config.pageMs : this.config.confirmMs;
+                if (now - this.since < duration || key === this.lastAction) return null;
+                this.lastAction = key;
+                return key;
+            }
+        }
+
+        function resolvePhotoNumber(page, number, count) {
+            const slot = number <= 4 ? number : number - 1;
+            const index = page * 8 + slot - 1;
+            return number >= 1 && number <= 9 && number !== 5 && index < count ? index : -1;
+        }
+        // END NUMBER GESTURES
+        const numberGesture = new NumberGestureGate(CONFIG.gesture);
+
+        function updatePhotoPage() {
+            const pages = Math.max(1, Math.ceil(photoMeshes.length / 8));
+            document.getElementById('photo-page').textContent = photoMeshes.length
+                ? '第 ' + (photoPage + 1) + ' / ' + pages + ' 页 · 本页 ' + Math.min(8, photoMeshes.length - photoPage * 8) + ' 张 · 共 ' + photoMeshes.length + ' 张'
+                : '上传照片后，伸出 数字手势 1–9查看';
+            const list = document.getElementById('photo-list');
+            list.replaceChildren();
+            photoMeshes.slice(photoPage * 8, photoPage * 8 + 8).forEach((mesh, slot) => {
+                const row = document.createElement('div');
+                row.textContent = (slot + 1) + ' · ' + mesh.userData.fileName;
+                row.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+                list.appendChild(row);
+            });
+        }
 
         // --- UI 控制 ---
         window.toggleUI = function() {
@@ -200,8 +301,8 @@
             const container = document.getElementById('canvas-container');
             
             scene = new THREE.Scene();
-            scene.background = new THREE.Color(0x050505); 
-            scene.fog = new THREE.FogExp2(0x050505, 0.002);
+            scene.fog = new THREE.FogExp2(0x0b202c, 0.0015);
+            createChristmasBackdrop();
 
             updateDimensions(); // 计算初始尺寸
 
@@ -212,7 +313,7 @@
             renderer.setSize(wrapper.clientWidth, wrapper.clientHeight);
             renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // 限制DPR以优化性能
             renderer.toneMapping = THREE.ACESFilmicToneMapping;
-            renderer.toneMappingExposure = 1.1;
+            renderer.toneMappingExposure = 0.85;
             container.appendChild(renderer.domElement);
 
             const pmremGenerator = new THREE.PMREMGenerator(renderer);
@@ -293,7 +394,7 @@
             // 树顶之星
             const starGeo = new THREE.OctahedronGeometry(3.0, 0);
             const starMat = new THREE.MeshPhysicalMaterial({ 
-                color: 0xffffff, metalness:0.8, roughness:0, emissive:0xffffee, emissiveIntensity:1.5 
+                color: 0xffffff, metalness:0.8, roughness:0, emissive:0xffffee, emissiveIntensity:0.6
             });
             const star = new THREE.Mesh(starGeo, starMat);
             star.userData = { 
@@ -390,10 +491,97 @@
             scene.add(stars);
         }
 
+        function createChristmasBackdrop() {
+            // 一张本地绘制的背景纹理，无需额外下载，避免影响摄像头和照片加载。
+            const canvas = document.createElement('canvas');
+            canvas.width = 1600; canvas.height = 1200;
+            const ctx = canvas.getContext('2d');
+            const sky = ctx.createLinearGradient(0, 0, 0, 1200);
+            sky.addColorStop(0, '#030d20');
+            sky.addColorStop(0.55, '#102d3b');
+            sky.addColorStop(1, '#244743');
+            ctx.fillStyle = sky; ctx.fillRect(0, 0, 1600, 1200);
+            const glow = ctx.createRadialGradient(800, 600, 20, 800, 600, 700);
+            glow.addColorStop(0, 'rgba(55,111,103,0.20)');
+            glow.addColorStop(1, 'rgba(5,15,28,0)');
+            ctx.fillStyle = glow; ctx.fillRect(0, 0, 1600, 1200);
+            for (let i = 0; i < 220; i++) {
+                ctx.fillStyle = `rgba(207,225,232,${0.15 + Math.random()*0.35})`;
+                ctx.beginPath(); ctx.arc(Math.random()*1600, Math.random()*1000, 0.5+Math.random(), 0, Math.PI*2); ctx.fill();
+            }
+            // 远处积雪松林，保持低对比，中央留给圣诞树和照片。
+            for (let layer = 0; layer < 2; layer++) {
+                for (let i = 0; i < 28; i++) {
+                    const x = i*65-70+Math.random()*35;
+                    const height = 90+Math.random()*140;
+                    const bottom = 1120+layer*65;
+                    ctx.fillStyle = layer ? '#0a222b' : '#1b3c46';
+                    for (let branch = 0; branch < 3; branch++) {
+                        const y = bottom-height+branch*height*0.23;
+                        const width = height*(0.18+branch*0.06);
+                        ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(x-width,y+height*0.55); ctx.lineTo(x+width,y+height*0.55); ctx.closePath(); ctx.fill();
+                    }
+                }
+            }
+            ctx.fillStyle = '#18323c';
+            ctx.beginPath(); ctx.moveTo(0,1140); ctx.quadraticCurveTo(500,1080,900,1150); ctx.quadraticCurveTo(1300,1090,1600,1130); ctx.lineTo(1600,1200); ctx.lineTo(0,1200); ctx.fill();
+            // 顶部垂挂灯串：暖金、酒红与松绿，光晕只留在画面边缘。
+            ctx.lineWidth = 3; ctx.strokeStyle = '#203d39';
+            ctx.beginPath(); ctx.moveTo(0,26); ctx.quadraticCurveTo(800,150,1600,26); ctx.stroke();
+            for (let i = 0; i <= 26; i++) {
+                const t = i/26, x = t*1600, y = 26+248*t*(1-t);
+                const color = ['216,171,91','164,64,64','78,136,109'][i%3];
+                const halo = ctx.createRadialGradient(x,y+13,0,x,y+13,28);
+                halo.addColorStop(0,`rgba(${color},0.24)`); halo.addColorStop(1,`rgba(${color},0)`);
+                ctx.fillStyle = halo; ctx.fillRect(x-28,y-15,56,56);
+                ctx.strokeStyle = '#2b4940'; ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(x,y+10); ctx.stroke();
+                ctx.fillStyle = `rgb(${color})`; ctx.beginPath(); ctx.ellipse(x,y+14,4,7,0,0,Math.PI*2); ctx.fill();
+            }
+            const background = new THREE.CanvasTexture(canvas);
+            background.colorSpace = THREE.SRGBColorSpace;
+            scene.background = background;
+
+            const dot = document.createElement('canvas'); dot.width = 32; dot.height = 32;
+            const dc = dot.getContext('2d');
+            const feather = dc.createRadialGradient(16,16,0,16,16,15);
+            feather.addColorStop(0,'rgba(230,242,255,0.9)'); feather.addColorStop(0.25,'rgba(230,242,255,0.5)'); feather.addColorStop(1,'rgba(230,242,255,0)');
+            dc.fillStyle = feather; dc.fillRect(0,0,32,32);
+            const positions = new Float32Array(450*3);
+            for (let i=0; i<450; i++) {
+                positions[i*3] = (Math.random()-0.5)*380;
+                positions[i*3+1] = (Math.random()-0.5)*300;
+                positions[i*3+2] = -100-Math.random()*100;
+            }
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position',new THREE.BufferAttribute(positions,3));
+            christmasSnow = new THREE.Points(geometry,new THREE.PointsMaterial({
+                map: new THREE.CanvasTexture(dot), color:0xc8dbe5, size:1.5,
+                transparent:true, opacity:0.5, depthWrite:false, fog:false
+            }));
+            scene.add(christmasSnow);
+        }
+
+        function updateChristmasSnow(now) {
+            if (!christmasSnow) return;
+            const dt = lastSnowTime === null ? 0 : Math.min((now-lastSnowTime)/1000,0.05);
+            lastSnowTime = now;
+            const positions = christmasSnow.geometry.attributes.position;
+            for (let i=0; i<positions.count; i++) {
+                let y = positions.getY(i)-dt*(3+i%5);
+                let x = positions.getX(i)+dt*Math.sin(now*0.0003+i)*1.5;
+                if (y < -150) y += 300;
+                if (x > 190) x -= 380;
+                if (x < -190) x += 380;
+                positions.setXY(i,x,y);
+            }
+            positions.needsUpdate = true;
+        }
+
         // --- 核心动画循环 ---
         function animate() {
             requestAnimationFrame(animate);
             time += 0.01;
+            updateChristmasSnow(performance.now());
 
             // 1. 更新实例化网格
             updateMeshLogic(goldMesh, logicData.gold);
@@ -403,6 +591,7 @@
 
             // 2. 更新粒子与照片
             updateDustLogic();
+            updateCameraFraming();
             updatePhotoLogic();
             
             // 3. 更新树顶星
@@ -515,25 +704,43 @@
             dustSystem.geometry.attributes.position.needsUpdate = true;
         }
 
+        function getCameraDistance() {
+            const verticalHalfFov = THREE.MathUtils.degToRad(camera.fov / 2);
+            const horizontalHalfFov = Math.atan(Math.tan(verticalHalfFov) * camera.aspect);
+            const halfFov = Math.min(verticalHalfFov, horizontalHalfFov);
+            const margin = 1.08;
+            // 包含照片的宽高及边框，而非仅让照片中心进入视野。
+            if (currentState === STATE.TREE) {
+                const halfWidth = CONFIG.maxRadius * 1.1 + CONFIG.photoSurfaceGap + 4.2;
+                const halfHeight = CONFIG.treeHeight / 2 + 4.2;
+                const depth = CONFIG.maxRadius * 1.1 + CONFIG.photoSurfaceGap;
+                return Math.max(CONFIG.camDistance, depth + margin * Math.max(
+                    halfHeight / Math.tan(verticalHalfFov), halfWidth / Math.tan(horizontalHalfFov)
+                ));
+            }
+            // 散开后整个球体会随手势旋转，按包围球拟合视野。
+            const radius = CONFIG.photoScatterRadius + Math.hypot(4.2, 4.2) * 3 / 2;
+            return Math.max(CONFIG.camDistance, margin * radius / Math.sin(halfFov));
+        }
+
+        function updateCameraFraming() {
+            const distance = getCameraDistance();
+            // 向外立即容纳照片，回到树形态时平滑拉近。
+            camera.position.z = distance > camera.position.z ? distance : THREE.MathUtils.lerp(camera.position.z, distance, 0.05);
+            camera.updateMatrixWorld();
+        }
+
         function updatePhotoLogic() {
-            // 获取相机在 mainGroup 局部坐标系下的反向位置
-            // 用于让照片始终朝向屏幕
-            _tempVec3.copy(camera.position).applyMatrix4(mainGroup.matrixWorld.clone().invert());
 
             photoMeshes.forEach((mesh, idx) => {
+                const highlighted = currentState === STATE.ZOOM && idx === zoomTargetIndex;
+                mesh.children[0].material.emissive.setHex(highlighted ? 0xffb300 : 0x000000);
+                mesh.children[0].material.emissiveIntensity = highlighted ? 0.18 : 0;
                 let targetPos, targetScale = 2.0; 
                 
                 if (currentState === STATE.ZOOM && idx === zoomTargetIndex) {
-                    // 1. 计算镜头正前方80单位的世界坐标
-                    const worldTarget = new THREE.Vector3(0, 0, 80);
-                    worldTarget.applyMatrix4(camera.matrixWorld); // 转换到世界坐标(如果相机动了)
-                    
-                    // 简单做法：直接取相机Z轴前方固定距离
-                    // 由于 mainGroup 在转动，我们需要求这一点的局部坐标
-                    // 实际上让照片飞到 (0,0,80) 相对于相机的点更简单，但为了保持层级，我们转换坐标
-                    
-                    // 简化策略：将目标设为相机前方，并应用 group 的逆变换
-                    const camFront = new THREE.Vector3(0, 0, 80); // 相机空间
+                    // 相机朝向局部 -Z，放在镜头前方 30 单位。
+                    const camFront = new THREE.Vector3(0, 0, -30);
                     camFront.applyMatrix4(camera.matrixWorld); // 世界空间
                     targetPos = mainGroup.worldToLocal(camFront); // 局部空间
 
@@ -546,12 +753,8 @@
                     // 非聚焦状态下，根据基础旋转+公转
                     if(currentState === STATE.SCATTER) targetScale = 3.0;
 
-                    if (currentState === STATE.TREE) {
-                         mesh.rotation.copy(mesh.userData.baseRot);
-                         mesh.rotation.y += 0.01;
-                    } else {
-                        mesh.lookAt(camera.position);
-                    }
+                    // 树底部的照片也始终以正面朝向镜头，避免侧面消失或背面被边框挡住。
+                    mesh.lookAt(camera.position);
                 }
                 
                 mesh.position.lerp(targetPos, 0.1);
@@ -627,6 +830,8 @@
                 handleGesture(landmarks);
             } else {
                 isHandPresent = false;
+                numberGesture.update(null, performance.now());
+                lastPalmTime = null;
                 // 如果没有手，自动回复一点点转速
                 if(currentState === STATE.SCATTER) {
                    // rotationVelocity.y = THREE.MathUtils.lerp(rotationVelocity.y, 0.002, 0.05);
@@ -653,85 +858,63 @@
         }
 
         function handleGesture(landmarks) {
-            // 计算手掌中心
-            const palmX = 1 - (landmarks[0].x + landmarks[9].x) / 2; // 镜像翻转 X
-            const palmY = (landmarks[0].y + landmarks[9].y) / 2;
-            
-            // 平滑位置
-            handPos.x = handPos.x * 0.7 + palmX * 0.3;
-            handPos.y = handPos.y * 0.7 + palmY * 0.3;
-
-            // 简单的手势判定算法
-            let folded = 0;
-            const tips = [8,12,16,20];
-            const bases = [5,9,13,17];
-            
-            // 指尖到指根距离判定握拳
-            tips.forEach((tipIdx, i) => { 
-                const d = Math.sqrt(
-                    Math.pow(landmarks[tipIdx].x - landmarks[0].x, 2) + 
-                    Math.pow(landmarks[tipIdx].y - landmarks[0].y, 2)
-                );
-                if(d < 0.25) folded++; 
-            });
-            
-            // 捏合检测 (食指拇指距离)
-            const dPinch = Math.sqrt(
-                Math.pow(landmarks[4].x - landmarks[8].x, 2) + 
-                Math.pow(landmarks[4].y - landmarks[8].y, 2)
-            );
-            
-            const isPinch = dPinch < 0.08;
-            const isFist = folded >= 3; 
-            const isOpen = !isFist && !isPinch;
-
-            // 状态机
-            if (isPinch && currentState === STATE.SCATTER) {
-                if (photoMeshes.length > 0) {
-                    switchToZoom();
-                    updateStatus("抓取照片: 聚焦回忆", "#ffd700");
-                } else {
-                    updateStatus("请先点击右下角上传照片", "#aaa");
+            const now = performance.now();
+            const raw = { x: 1 - (landmarks[0].x + landmarks[9].x) / 2, y: (landmarks[0].y + landmarks[9].y) / 2 };
+            const fresh = lastPalmTime === null || now - lastPalmTime > CONFIG.gesture.maxGapMs;
+            const alpha = fresh ? 1 : 1 - Math.exp(-(now-lastPalmTime) / CONFIG.gesture.emaTimeMs);
+            handPos.x += alpha * (raw.x - handPos.x);
+            handPos.y += alpha * (raw.y - handPos.y);
+            if (fresh) Object.assign(lastHandPos, handPos);
+            lastPalmTime = now;
+            const key = classifyHand(landmarks);
+            const action = numberGesture.update(key, now);
+            if (!action) {
+                if (key && key !== numberGesture.lastAction) {
+                    const label = key === 'next' ? '下一页' : key === 'previous' ? '上一页' : key === 'fist' ? '返回圣诞树' : key === '5' ? '散开照片' : '本页照片 ' + (Number(key) > 5 ? Number(key)-1 : key);
+                    updateStatus('识别到：' + label + ' · 保持手势', '#ffd700');
                 }
-            } else if (isFist) {
+                return;
+            }
+            if (action === '5') {
+                currentState = STATE.SCATTER;
+                zoomTargetIndex = -1;
+                rotationVelocity.x = 0; rotationVelocity.y = 0;
+                Object.assign(lastHandPos, handPos);
+                updateStatus('五指张开：星云散开 · 挥手旋转', '#00aaff');
+            } else if (action === 'fist') {
                 currentState = STATE.TREE;
                 zoomTargetIndex = -1;
                 rotationVelocity.x = 0; rotationVelocity.y = 0;
-                updateStatus("握拳: 聚合形态", "#0f0");
-            } else if (isOpen) {
-                if (currentState === STATE.ZOOM && !isPinch) {
+                updateStatus('握拳：返回圣诞树 · 数字手势查看照片', '#0f0');
+            } else if (action === 'next' || action === 'previous') {
+                const pages = Math.max(1, Math.ceil(photoMeshes.length / 8));
+                const next = Math.max(0, Math.min(pages-1, photoPage + (action === 'next' ? 1 : -1)));
+                if (next === photoPage) {
+                    updateStatus(action === 'next' ? '已经是最后一页' : '已经是第一页', '#aaa');
+                } else {
+                    photoPage = next;
                     currentState = STATE.SCATTER;
                     zoomTargetIndex = -1;
-                } else if (currentState === STATE.TREE) {
-                    currentState = STATE.SCATTER;
-                    // 重置惯性位置避免跳变
-                    lastHandPos.x = handPos.x; lastHandPos.y = handPos.y;
+                    Object.assign(lastHandPos, handPos);
+                    updateStatus('已翻页 · 伸出 数字手势 1–9查看本页照片', '#00aaff');
                 }
-                updateStatus("张手: 星云散开 (挥手旋转)", "#00aaff");
+                updatePhotoPage();
+            } else {
+                const index = resolvePhotoNumber(photoPage, Number(action), photoMeshes.length);
+                if (index === -1) {
+                    updateStatus(photoMeshes.length ? '本页没有第 ' + (Number(action) > 5 ? Number(action)-1 : action) + ' 张照片' : '请先上传照片', '#aaa');
+                    return;
+                }
+                switchToZoom(index);
+                updateStatus('正在展示：第 ' + (photoPage+1) + ' 页 / 照片 ' + (index % 8 + 1) + ' · 换数字切换，握拳返回', '#ffd700');
             }
         }
-        
-        function switchToZoom() {
+
+        function switchToZoom(index) {
+            if (index < 0 || index >= photoMeshes.length) return;
             currentState = STATE.ZOOM;
             targetState = STATE.ZOOM;
-            
-            // 智能选择逻辑：选离镜头最近的照片
-            if (zoomTargetIndex === -1 && photoMeshes.length > 0) {
-                let minDist = Infinity;
-                let bestIdx = 0;
-                const camPos = camera.position;
-                const worldPos = new THREE.Vector3();
-
-                photoMeshes.forEach((mesh, idx) => {
-                    mesh.getWorldPosition(worldPos);
-                    const d = worldPos.distanceTo(camPos);
-                    if (d < minDist) {
-                        minDist = d;
-                        bestIdx = idx;
-                    }
-                });
-                zoomTargetIndex = bestIdx;
-            }
+            zoomTargetIndex = index;
         }
 
         function onWindowResize() {
@@ -743,27 +926,31 @@
         }
 
         // --- 照片上传处理 ---
+        let photoUploadQueue = Promise.resolve();
         document.getElementById('file-input').addEventListener('change', function(e) {
-            const files = e.target.files;
-            if (!files.length) return;
-            
-            let loadedCount = 0;
-            for(let i=0; i<files.length; i++) {
-                const reader = new FileReader();
-                reader.onload = function(evt) {
-                    const img = new Image();
-                    img.src = evt.target.result;
-                    img.onload = () => { 
-                        addPhotoMesh(img); 
-                        loadedCount++;
-                        updateStatus(`已加载 ${loadedCount} 张照片`, "#fff");
-                    }
+            const files = Array.from(e.target.files);
+            e.target.value = '';
+            photoUploadQueue = photoUploadQueue.then(async () => {
+                let failed = 0;
+                // 顺序解码，照片编号不受异步加载速度影响。
+                for (const file of files) {
+                    const url = URL.createObjectURL(file);
+                    try {
+                        const img = new Image();
+                        img.src = url;
+                        await img.decode();
+                        addPhotoMesh(img, file.name);
+                    } catch (error) { failed++; console.error('无法加载照片', file.name, error); }
+                    finally { URL.revokeObjectURL(url); }
                 }
-                reader.readAsDataURL(files[i]);
-            }
+                numberGesture.lastAction = null;
+                numberGesture.reset();
+                updatePhotoPage();
+                updateStatus('已加载 ' + photoMeshes.length + ' 张照片 · 伸出 数字手势 1–9查看' + (failed ? '（' + failed + ' 张加载失败）' : ''), '#fff');
+            });
         });
 
-        function addPhotoMesh(img) {
+        function addPhotoMesh(img, fileName) {
             const tex = new THREE.Texture(img);
             tex.needsUpdate = true;
             tex.colorSpace = THREE.SRGBColorSpace;
@@ -775,7 +962,7 @@
 
             const geo = new THREE.PlaneGeometry(w, h);
             const mat = new THREE.MeshBasicMaterial({ 
-                map: tex, side: THREE.DoubleSide 
+                map: tex, side: THREE.DoubleSide, toneMapped: false
             });
             const mesh = new THREE.Mesh(geo, mat);
             
@@ -790,15 +977,14 @@
             // 随机分布
             const h_pos = (Math.random() - 0.5) * CONFIG.treeHeight;
             const normH = (h_pos + CONFIG.treeHeight/2) / CONFIG.treeHeight;
-            const maxR = CONFIG.maxRadius * (1 - normH) + 2;
-            
-            const r = maxR * (0.6 + 0.4 * Math.random());
+            const r = CONFIG.maxRadius * (1 - normH) * 1.1 + CONFIG.photoSurfaceGap;
             const theta = Math.random() * Math.PI * 2;
             
             const treePos = new THREE.Vector3(r * Math.cos(theta), h_pos, r * Math.sin(theta));
-            const scatterPos = randomSpherePoint(60);
+            const scatterPos = randomSpherePoint(CONFIG.photoScatterRadius);
 
             mesh.userData = { 
+                fileName,
                 treePos, 
                 scatterPos, 
                 baseRot: new THREE.Euler(0, theta + Math.PI/2, 0) // 面向外部
